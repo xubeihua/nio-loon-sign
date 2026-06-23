@@ -1,15 +1,11 @@
-#!name=蔚来 NIO 签到调试版
-#!desc=捕获你自己的蔚来 App 认证头和签到请求，并定时重放签到。首次使用请先按 README 手动捕获一次。
-#!author=xubeihua
-#!homepage=https://www.nio.cn/
+#!name=蔚来自动签到 Loon 版
+#!desc=基于 atopsecret/weilai-auto-checkin 改写：自动捕获 Authorization token，定时签到并显示连续/累计签到天数。
+#!author=atopsecret + Codex Loon adapter
+#!homepage=https://github.com/atopsecret/weilai-auto-checkin
 
 [Script]
-# 1. 打开 MITM 后，进入蔚来 App，刷新首页/积分/签到页；再手动点一次签到。
-# 2. 该捕获脚本会保存最近的 NIO 认证头，以及最像“签到”的请求。
-http-request ^https?:\/\/[^\/]*nio[^\/]*\/.* script-path=https://raw.githubusercontent.com/xubeihua/nio-loon-sign/refs/heads/main/nio-sign.js, requires-body=true, timeout=20, tag=NIO Capture
-
-# 每天 09:05 自动签到。也可在 Loon 脚本页手动运行调试。
-cron "5 9 * * *" script-path=https://raw.githubusercontent.com/xubeihua/nio-loon-sign/refs/heads/main/nio-sign.js, timeout=30, tag=NIO Daily Sign
+http-request ^https:\/\/(gateway-front-external\.nio\.com|app\.nio\.com|api\.nio\.com)\/.* script-path=https://raw.githubusercontent.com/xubeihua/nio-loon-sign/refs/heads/main/nio-sign.js, requires-body=false, timeout=10, tag=蔚来Token捕获
+cron "5 9 * * *" script-path=https://raw.githubusercontent.com/xubeihua/nio-loon-sign/refs/heads/main/nio-sign.js, timeout=60, tag=蔚来自动签到
 
 [MITM]
-hostname = %APPEND% *.nio.com, *.nio.cn
+hostname = %APPEND% gateway-front-external.nio.com, app.nio.com, api.nio.com
