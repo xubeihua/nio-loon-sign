@@ -135,11 +135,22 @@ function looksLikeSignRequest(url) {
   return CONFIG.signKeywords.some((word) => text.includes(word));
 }
 
+function isStaticAsset(url) {
+  const path = url.split('?')[0].toLowerCase();
+  return /\.(ttf|otf|woff|woff2|eot|css|js|map|png|jpe?g|gif|webp|svg|ico|mp4|mov|m4v|webm|mp3|m4a|aac|wav|json)$/.test(path);
+}
+
 function capture() {
   const url = $request.url;
   const method = ($request.method || 'GET').toUpperCase();
   const headers = normalizeHeaders($request.headers || {});
   const body = $request.body || '';
+
+  if (isStaticAsset(url)) {
+    if (CONFIG.debug) log('跳过静态资源请求', { method, url });
+    return $done({});
+  }
+
   const authHeaders = pickAuthHeaders(headers);
 
   if (Object.keys(authHeaders).length > 0) {
