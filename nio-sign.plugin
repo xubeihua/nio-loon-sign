@@ -1,6 +1,6 @@
 #!name=蔚来 NIO 签到调试版
 #!desc=捕获你自己的蔚来 App 认证头和签到请求，并定时重放签到。首次使用请先按 README 手动捕获一次。
-#!author=Codex
+#!author=xubeihua
 #!homepage=https://www.nio.cn/
 
 [Script]
