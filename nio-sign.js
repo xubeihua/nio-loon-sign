@@ -1,270 +1,380 @@
 /*
- * 蔚来 NIO App Loon 签到调试版
+ * 蔚来 APP 自动签到脚本 for Loon
  *
- * 用法：
- * - 先安装 nio-sign.plugin，并给 *.nio.com / *.nio.cn 开启 MITM。
- * - 打开蔚来 App，访问签到/积分/任务页，手动签到一次。
- * - 捕获成功后，定时任务会复用已保存的签到请求和最新认证头。
+ * Adapted from:
+ * https://github.com/atopsecret/weilai-auto-checkin
  *
- * 只用于自动化你自己的账号请求。接口如变更，请看 Loon 日志里的 NIO_SIGN_DEBUG。
+ * Loon 使用：
+ * 1. 导入 weilai-auto-checkin-loon.plugin。
+ * 2. 开启 Loon、MitM，并信任证书。
+ * 3. 打开蔚来 App，进入我的/积分/签到等页面，等待捕获 Authorization。
+ * 4. 手动运行“蔚来自动签到”测试。
  */
 
-const STORE = {
-  auth: 'nio.sign.auth.v1',
-  signReq: 'nio.sign.request.v1',
-  lastDebug: 'nio.sign.lastDebug.v1',
-};
-
 const CONFIG = {
-  notify: true,
-  debug: true,
-  // 路径或 query 命中这些词时，会优先认为是“签到请求”。
-  signKeywords: [
-    'checkin',
-    'check-in',
-    'signin',
-    'sign-in',
-    'daily_sign',
-    'daily-sign',
-    'sign',
-    'calendar',
-    'task',
-    'points',
-    'point',
-    'credit',
-    'member',
-    'growth',
-  ],
-  // 这些头会从 App 请求中保存下来，定时任务重放时自动覆盖旧值。
-  authHeaderNames: [
-    'authorization',
-    'access-token',
-    'x-access-token',
-    'x-token',
-    'token',
-    'app_id',
-    'app-id',
-    'x-app-id',
-    'device_id',
-    'device-id',
-    'x-device-id',
-    'user-agent',
-    'content-type',
-    'accept',
-    'accept-language',
-    'nio-app-id',
-    'nio-device-id',
-    'nio-token',
-  ],
+  baseURL: 'https://gateway-front-external.nio.com',
+  appId: '10086',
+  userAgent:
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 NIOAppCN/5.48.5 (com.do1.WeiLaiApp; build:2549; OS:iOS) webview/lg _dsbridge',
+  maxRetries: 2,
+  retryDelay: 2000,
+  tokenStorageKey: 'weilai_auth_token',
+  lastUpdateKey: 'weilai_token_last_update',
+  tokenValidDays: 30,
+  targetDomains: ['gateway-front-external.nio.com', 'app.nio.com', 'api.nio.com'],
+  targetPaths: ['/checkin', '/award', '/user', '/profile', '/api', '/moat'],
 };
 
-function isRequestMode() {
-  return typeof $request !== 'undefined' && $request && $request.url;
+function done(value) {
+  if (typeof $done === 'function') $done(value || {});
 }
 
-function readJson(key, fallback) {
-  const raw = $persistentStore.read(key);
-  if (!raw) return fallback;
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    log(`读取 ${key} 失败: ${err.message}`);
-    return fallback;
+function notify(title, subtitle, body) {
+  $notification.post(title, subtitle || '', body || '');
+}
+
+function log(message, value) {
+  if (value === undefined) {
+    console.log(`[WEILAI_LOON] ${message}`);
+  } else {
+    console.log(`[WEILAI_LOON] ${message} ${safeJson(value)}`);
   }
 }
 
-function writeJson(key, value) {
-  return $persistentStore.write(JSON.stringify(value), key);
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
-function log(message, data) {
-  const line = `[NIO_SIGN_DEBUG] ${message}${data ? ` ${safeJson(data)}` : ''}`;
-  console.log(line);
-  $persistentStore.write(`${now()} ${line}`, STORE.lastDebug);
-}
-
 function safeJson(value) {
-  return JSON.stringify(value, (key, val) => {
-    if (typeof val !== 'string') return val;
-    if (/authorization|token|cookie|secret|session|access/i.test(key)) return mask(val);
-    return val.length > 800 ? `${val.slice(0, 800)}...<trimmed>` : val;
-  });
+  try {
+    return JSON.stringify(value, (key, val) => {
+      if (typeof val !== 'string') return val;
+      if (/authorization|token|cookie/i.test(key)) return mask(val);
+      return val.length > 1000 ? `${val.slice(0, 1000)}...<trimmed>` : val;
+    });
+  } catch (_) {
+    return String(value);
+  }
 }
 
 function mask(value) {
   if (!value) return value;
-  if (value.length <= 12) return '***';
-  return `${value.slice(0, 6)}***${value.slice(-6)}`;
+  if (value.length <= 18) return '***';
+  return `${value.slice(0, 12)}***${value.slice(-6)}`;
 }
 
-function normalizeHeaders(headers) {
-  const out = {};
-  Object.keys(headers || {}).forEach((name) => {
-    out[name.toLowerCase()] = String(headers[name]);
-  });
-  return out;
-}
-
-function pickAuthHeaders(headers) {
-  const lower = normalizeHeaders(headers);
-  const picked = {};
-  CONFIG.authHeaderNames.forEach((name) => {
-    const key = name.toLowerCase();
-    if (lower[key]) picked[key] = lower[key];
-  });
-  // Cookie 可能含登录态，默认保存但日志会脱敏。
-  if (lower.cookie) picked.cookie = lower.cookie;
-  return picked;
-}
-
-function mergeHeaders(saved, latest) {
-  const merged = Object.assign({}, normalizeHeaders(saved || {}), normalizeHeaders(latest || {}));
-  delete merged.host;
-  delete merged['content-length'];
-  delete merged['accept-encoding'];
-  delete merged.connection;
-  return merged;
-}
-
-function looksLikeSignRequest(url) {
-  const text = decodeURIComponent(url).toLowerCase();
-  return CONFIG.signKeywords.some((word) => text.includes(word));
-}
-
-function isStaticAsset(url) {
-  const path = url.split('?')[0].toLowerCase();
-  return /\.(ttf|otf|woff|woff2|eot|css|js|map|png|jpe?g|gif|webp|svg|ico|mp4|mov|m4v|webm|mp3|m4a|aac|wav|json)$/.test(path);
-}
-
-function capture() {
-  const url = $request.url;
-  const method = ($request.method || 'GET').toUpperCase();
-  const headers = normalizeHeaders($request.headers || {});
-  const body = $request.body || '';
-
-  if (isStaticAsset(url)) {
-    if (CONFIG.debug) log('跳过静态资源请求', { method, url });
-    return $done({});
+function getHeader(headers, name) {
+  const target = name.toLowerCase();
+  const keys = Object.keys(headers || {});
+  for (let i = 0; i < keys.length; i += 1) {
+    if (keys[i].toLowerCase() === target) return headers[keys[i]];
   }
-
-  const authHeaders = pickAuthHeaders(headers);
-
-  if (Object.keys(authHeaders).length > 0) {
-    const oldAuth = readJson(STORE.auth, {});
-    const nextAuth = {
-      updatedAt: now(),
-      url,
-      headers: mergeHeaders(oldAuth.headers, authHeaders),
-    };
-    writeJson(STORE.auth, nextAuth);
-    if (CONFIG.debug) log('已更新 NIO 认证头', { url, headers: nextAuth.headers });
-  }
-
-  if (looksLikeSignRequest(url)) {
-    const signReq = {
-      updatedAt: now(),
-      url,
-      method,
-      headers: mergeHeaders(headers, authHeaders),
-      body,
-    };
-    writeJson(STORE.signReq, signReq);
-    notify('NIO 捕获成功', '已保存疑似签到请求', `${method} ${url}`);
-    log('已保存疑似签到请求', signReq);
-  } else if (CONFIG.debug) {
-    log('捕获到 NIO 请求，但不像签到接口', { method, url, authHeaderCount: Object.keys(authHeaders).length });
-  }
-
-  $done({});
+  return null;
 }
 
-function requestOptions(signReq, auth) {
-  const method = (signReq.method || 'GET').toUpperCase();
-  const headers = mergeHeaders(signReq.headers, auth.headers);
-  const options = {
-    url: signReq.url,
-    method,
-    headers,
-  };
-  if (method !== 'GET' && signReq.body) options.body = signReq.body;
-  return options;
-}
-
-function runSign() {
-  const signReq = readJson(STORE.signReq, null);
-  const auth = readJson(STORE.auth, null);
-
-  if (!signReq) {
-    notify('NIO 签到未配置', '还没有捕获到签到请求', '请开启 MITM 后在蔚来 App 手动签到一次。');
-    log('缺少签到请求配置');
-    return $done();
-  }
-
-  if (!auth || !auth.headers || Object.keys(auth.headers).length === 0) {
-    notify('NIO 签到未配置', '还没有捕获到认证头', '请打开蔚来 App 刷新一次，再手动运行脚本。');
-    log('缺少认证头配置', { signReq });
-    return $done();
-  }
-
-  const options = requestOptions(signReq, auth);
-  log('开始签到请求', options);
-
-  $httpClient.request(options, (error, response, body) => {
-    const status = response && response.status;
-    const text = body || '';
-    const parsed = tryParseJson(text);
-    const resultText = summarizeResponse(status, parsed, text);
-
-    log('签到响应', { error: error && String(error), status, body: parsed || text });
-
-    if (error) {
-      notify('NIO 签到请求失败', String(error), '请查看 Loon 日志 NIO_SIGN_DEBUG。');
-      return $done();
-    }
-
-    notify('NIO 签到完成', `HTTP ${status || 'unknown'}`, resultText);
-    $done();
-  });
-}
-
-function tryParseJson(text) {
-  if (!text) return null;
+function shouldInterceptRequest(url) {
   try {
-    return JSON.parse(text);
-  } catch (_) {
+    const urlObj = new URL(url);
+    const domainMatch = CONFIG.targetDomains.some((domain) => urlObj.hostname === domain || urlObj.hostname.endsWith(`.${domain}`));
+    if (!domainMatch) return false;
+
+    return CONFIG.targetPaths.some((path) => urlObj.pathname.includes(path));
+  } catch (error) {
+    log('URL 解析失败', { url, error: String(error) });
+    return false;
+  }
+}
+
+function extractToken(headers) {
+  const authHeader = getHeader(headers, 'authorization');
+  if (!authHeader) return null;
+
+  const token = String(authHeader).trim();
+  if (/^Bearer\s+.+/i.test(token) && token.length > 20) return token;
+  return null;
+}
+
+function saveToken(token) {
+  const currentTime = Date.now();
+  const ok1 = $persistentStore.write(token, CONFIG.tokenStorageKey);
+  const ok2 = $persistentStore.write(String(currentTime), CONFIG.lastUpdateKey);
+
+  if (!ok1 || !ok2) {
+    log('Token 保存失败');
+    return false;
+  }
+
+  log('Token 已保存', {
+    token,
+    savedAt: new Date(currentTime).toLocaleString('zh-CN'),
+  });
+  return true;
+}
+
+function getSavedToken() {
+  const token = $persistentStore.read(CONFIG.tokenStorageKey);
+  const lastUpdate = $persistentStore.read(CONFIG.lastUpdateKey);
+  if (!token || !lastUpdate) return null;
+
+  const lastUpdateTime = Number(lastUpdate);
+  if (!Number.isFinite(lastUpdateTime)) return null;
+
+  return {
+    token,
+    lastUpdate: lastUpdateTime,
+    isExpired: isTokenExpired(lastUpdateTime),
+  };
+}
+
+function isTokenExpired(lastUpdate) {
+  const expireTime = lastUpdate + CONFIG.tokenValidDays * 24 * 60 * 60 * 1000;
+  return Date.now() > expireTime;
+}
+
+function getValidToken() {
+  const tokenInfo = getSavedToken();
+  if (!tokenInfo) {
+    log('未找到保存的 token');
+    return null;
+  }
+
+  if (tokenInfo.isExpired) {
+    notify('蔚来签到', 'Token 已过期', '请打开蔚来 App 进入我的/积分/签到页面刷新一次');
+    log('Token 已过期');
+    return null;
+  }
+
+  const remainingDays = Math.ceil((tokenInfo.lastUpdate + CONFIG.tokenValidDays * 24 * 60 * 60 * 1000 - Date.now()) / 86400000);
+  log(`Token 有效，剩余约 ${remainingDays} 天`);
+  return tokenInfo.token;
+}
+
+function handleTokenCapture(request) {
+  const url = request.url;
+  const headers = request.headers || {};
+  log('Token 捕获模式', { url });
+
+  if (!shouldInterceptRequest(url)) {
+    log('跳过非目标请求', { url });
+    return;
+  }
+
+  const token = extractToken(headers);
+  if (!token) {
+    log('未找到 Authorization Bearer token', { url, headerNames: Object.keys(headers) });
+    return;
+  }
+
+  const savedTokenInfo = getSavedToken();
+  if (savedTokenInfo && savedTokenInfo.token === token && !savedTokenInfo.isExpired) {
+    log('Token 未变化，跳过保存');
+    return;
+  }
+
+  if (saveToken(token)) {
+    notify('蔚来 Token', savedTokenInfo ? 'Token 已更新' : 'Token 已获取', '可以手动运行“蔚来自动签到”测试');
+  }
+}
+
+function buildParams() {
+  return {
+    app_id: CONFIG.appId,
+    timestamp: Date.now(),
+  };
+}
+
+function buildURL(params) {
+  const queryString = Object.keys(params)
+    .map((key) => `${key}=${encodeURIComponent(params[key])}`)
+    .join('&');
+  return `${CONFIG.baseURL}/moat/10086/c/award_cn/checkin?${queryString}`;
+}
+
+function buildHeaders(token) {
+  return {
+    'content-type': 'application/x-www-form-urlencoded',
+    accept: 'application/json, text/plain, */*',
+    authorization: token,
+    'accept-language': 'zh-CN,zh-Hans;q=0.9',
+    origin: 'null',
+    'user-agent': CONFIG.userAgent,
+  };
+}
+
+function formatDateTime(timestamp) {
+  if (!timestamp) return '';
+  const ms = Number(timestamp) > 1000000000000 ? Number(timestamp) : Number(timestamp) * 1000;
+  return new Date(ms).toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function extractCheckinStats(result) {
+  const data = result && result.data ? result.data : {};
+  const stats = data.stats || {};
+  const awardInfo = data.award_info || {};
+
+  const continuousDays =
+    stats.continuous_checkin_days ||
+    stats.continuousDays ||
+    stats.consecutive_days ||
+    data.continuous_checkin_days ||
+    data.continuousDays ||
+    data.consecutive_days ||
+    awardInfo.continuous_days ||
+    awardInfo.continuous_checkin_days ||
+    0;
+
+  const accumulateDays =
+    stats.accumulate_days ||
+    stats.accumulateDays ||
+    stats.total_days ||
+    data.accumulate_days ||
+    data.accumulateDays ||
+    data.total_days ||
+    awardInfo.total_days ||
+    awardInfo.accumulate_days ||
+    0;
+
+  const checkedIn = data.checked_in === true || data.is_checkin === true || data.has_checkin === true;
+  const checkinTime = stats.checkin_time || data.checkin_time || data.checked_in_time || '';
+  const tip = data.tip || result.message || result.msg || '签到完成';
+
+  return { continuousDays, accumulateDays, checkedIn, checkinTime, tip };
+}
+
+function parseResponse(data) {
+  try {
+    return JSON.parse(data || '{}');
+  } catch (error) {
+    log('响应 JSON 解析失败', { error: String(error), data });
     return null;
   }
 }
 
-function summarizeResponse(status, parsed, text) {
-  if (parsed) {
-    const candidates = [
-      parsed.message,
-      parsed.msg,
-      parsed.error,
-      parsed.errmsg,
-      parsed.desc,
-      parsed.data && parsed.data.message,
-      parsed.data && parsed.data.msg,
-    ].filter(Boolean);
-    if (candidates.length) return String(candidates[0]).slice(0, 180);
-    return safeJson(parsed).slice(0, 180);
+function buildStatsMessage(tip, stats) {
+  const lines = [tip || '签到完成'];
+  if (stats.continuousDays || stats.accumulateDays) {
+    lines.push(`连续签到：${stats.continuousDays || 0} 天`);
+    lines.push(`累计签到：${stats.accumulateDays || 0} 天`);
   }
-  if (!text) return '无响应正文';
-  return String(text).replace(/\s+/g, ' ').slice(0, 180);
+  if (stats.checkinTime) lines.push(`签到时间：${formatDateTime(stats.checkinTime)}`);
+  return lines.join('\n');
 }
 
-function notify(title, subtitle, message) {
-  if (!CONFIG.notify) return;
-  $notification.post(title, subtitle || '', message || '');
+function handleResponse(response, data, token, callback) {
+  const result = parseResponse(data);
+  if (!result) {
+    notify('蔚来签到', '响应解析失败', '请查看 Loon 日志 WEILAI_LOON');
+    callback(false);
+    return;
+  }
+
+  log('签到响应', result);
+  const stats = extractCheckinStats(result);
+  const success = response && response.status === 200 && result.result_code === 'success';
+
+  if (success) {
+    if (!stats.accumulateDays && !stats.continuousDays) {
+      fetchCheckinStats(token, stats.tip || '签到成功', callback);
+      return;
+    }
+
+    notify('蔚来签到', '签到成功', buildStatsMessage(stats.tip, stats));
+    callback(true);
+    return;
+  }
+
+  if (stats.checkedIn || /已签到|已经签到|重复签到/.test(`${stats.tip}${result.message || ''}${result.msg || ''}`)) {
+    notify('蔚来签到', '今日已签到', buildStatsMessage(stats.tip || '今日已签到', stats));
+    callback(true);
+    return;
+  }
+
+  const errorMsg = result.message || result.msg || result.error || '签到失败';
+  notify('蔚来签到', '签到失败', String(errorMsg));
+  callback(false);
 }
 
-if (isRequestMode()) {
-  capture();
-} else {
-  runSign();
+function fetchCheckinStats(token, tip, callback) {
+  const request = {
+    url: buildURL(buildParams()),
+    method: 'POST',
+    headers: buildHeaders(token),
+    body: 'event=checkin',
+  };
+
+  log('尝试再次获取签到统计', request);
+  $httpClient.request(request, (error, response, data) => {
+    if (error) {
+      log('获取统计失败', String(error));
+      notify('蔚来签到', '签到成功', tip || '签到成功，但统计信息获取失败');
+      callback(true);
+      return;
+    }
+
+    const result = parseResponse(data);
+    if (!result) {
+      notify('蔚来签到', '签到成功', tip || '签到成功，但统计信息解析失败');
+      callback(true);
+      return;
+    }
+
+    const stats = extractCheckinStats(result);
+    notify('蔚来签到', '签到成功', buildStatsMessage(tip || stats.tip, stats));
+    callback(true);
+  });
 }
+
+function performCheckin(token, retryCount) {
+  const request = {
+    url: buildURL(buildParams()),
+    method: 'POST',
+    headers: buildHeaders(token),
+    body: 'event=checkin',
+  };
+
+  log(`开始签到，尝试 ${retryCount + 1}/${CONFIG.maxRetries + 1}`, request);
+  $httpClient.request(request, (error, response, data) => {
+    if (error) {
+      log('网络请求失败', { error: String(error), retryCount });
+      if (retryCount < CONFIG.maxRetries) {
+        setTimeout(() => performCheckin(token, retryCount + 1), CONFIG.retryDelay);
+        return;
+      }
+      notify('蔚来签到', '网络错误', String(error));
+      done();
+      return;
+    }
+
+    log('HTTP 状态', response && response.status);
+    handleResponse(response, data, token, (ok) => {
+      if (!ok && retryCount < CONFIG.maxRetries) {
+        setTimeout(() => performCheckin(token, retryCount + 1), CONFIG.retryDelay);
+        return;
+      }
+      done();
+    });
+  });
+}
+
+function main() {
+  if (typeof $request !== 'undefined' && $request && $request.url) {
+    handleTokenCapture($request);
+    done();
+    return;
+  }
+
+  log('蔚来自动签到 Loon 版启动');
+  const token = getValidToken();
+  if (!token) {
+    notify('蔚来签到', 'Token 获取失败', '请打开蔚来 App 进入我的/积分/签到页面刷新一次');
+    done();
+    return;
+  }
+
+  performCheckin(token, 0);
+}
+
+main();
