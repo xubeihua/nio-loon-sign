@@ -197,6 +197,23 @@ function buildHeaders(token) {
   };
 }
 
+function sendRequest(request, callback) {
+  const method = String(request.method || 'GET').toUpperCase();
+  if (method === 'POST') {
+    $httpClient.post(request, callback);
+    return;
+  }
+  if (method === 'PUT' && typeof $httpClient.put === 'function') {
+    $httpClient.put(request, callback);
+    return;
+  }
+  if (method === 'DELETE' && typeof $httpClient.delete === 'function') {
+    $httpClient.delete(request, callback);
+    return;
+  }
+  $httpClient.get(request, callback);
+}
+
 function formatDateTime(timestamp) {
   if (!timestamp) return '';
   const ms = Number(timestamp) > 1000000000000 ? Number(timestamp) : Number(timestamp) * 1000;
@@ -306,7 +323,7 @@ function fetchCheckinStats(token, tip, callback) {
   };
 
   log('尝试再次获取签到统计', request);
-  $httpClient.request(request, (error, response, data) => {
+  sendRequest(request, (error, response, data) => {
     if (error) {
       log('获取统计失败', String(error));
       notify('蔚来签到', '签到成功', tip || '签到成功，但统计信息获取失败');
@@ -336,7 +353,7 @@ function performCheckin(token, retryCount) {
   };
 
   log(`开始签到，尝试 ${retryCount + 1}/${CONFIG.maxRetries + 1}`, request);
-  $httpClient.request(request, (error, response, data) => {
+  sendRequest(request, (error, response, data) => {
     if (error) {
       log('网络请求失败', { error: String(error), retryCount });
       if (retryCount < CONFIG.maxRetries) {
