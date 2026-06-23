@@ -1,6 +1,6 @@
 #!name=蔚来自动签到 Loon 版
 #!desc=基于 atopsecret/weilai-auto-checkin 改写：自动捕获 Authorization token，定时签到并显示连续/累计签到天数。
-#!author=atopsecret + Codex Loon adapter
+#!author=xubeihua
 #!homepage=https://github.com/atopsecret/weilai-auto-checkin
 
 [Script]
